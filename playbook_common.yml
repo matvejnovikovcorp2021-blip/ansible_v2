@@ -1,6 +1,6 @@
 ---
-- name: 'Configure node1 (all 9 requirements)'
-  hosts: localhost
+- name: 'Configure node1/node2 (all 9 requirements)'
+  hosts: all
   connection: local
   become: yes
 
@@ -23,11 +23,23 @@
       args:
         executable: /bin/bash
 
-    - name: '2. Установка nginx'
+    - name: '2. Проверить, установлен ли nginx'
+      command: /usr/sbin/nginx -v
+      register: nginx_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: '2. Установить nginx (если не установлен)'
       apt:
         name: nginx
         state: present
         update_cache: yes
+      when: nginx_check is failed
+
+    - name: '2. Вывести версию nginx'
+      debug:
+        msg: "Nginx version: {{ nginx_check.stderr }}"
+      when: nginx_check is success
 
     - name: '3. Установка необходимых пакетов для Docker'
       apt:
