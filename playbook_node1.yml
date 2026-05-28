@@ -1,0 +1,197 @@
+---
+- name: 'Configure node1 (all 9 requirements)'
+  hosts: localhost
+  connection: local
+  become: yes
+
+  vars:
+    nginx_port: 8080
+    download_url: "https://raw.githubusercontent.com/ansible/ansible/stable-2.9/examples/ansible.cfg"
+    download_dest: "/tmp/ansible.cfg"
+    git_repos:
+      - { url: "https://github.com/psf/requests.git", dest: "/opt/requests" }
+      - { url: "https://github.com/pallets/click.git", dest: "/opt/click" }
+      - { url: "https://github.com/pallets/jinja.git", dest: "/opt/jinja" }
+
+  tasks:
+    - name: '1. Записать время и имя пользователя в файл'
+      shell: |
+        echo "=== System Info ===" > /home/vagrant/system_info.txt
+        echo "User: vagrant" >> /home/vagrant/system_info.txt
+        echo "Time: $(date)" >> /home/vagrant/system_info.txt
+        echo "Host: $(hostname)" >> /home/vagrant/system_info.txt
+      args:
+        executable: /bin/bash
+
+    - name: '2. Установка nginx'
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: '3. Установка необходимых пакетов для Docker'
+      apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+
+    - name: '3. Создать директорию для ключей Docker'
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: '3. Добавить GPG ключ Docker'
+      get_url:
+        url: "https://download.docker.com/linux/debian/gpg"
+        dest: "/etc/apt/keyrings/docker.asc"
+        mode: '0644'
+
+    - name: '3. Добавить репозиторий Docker'
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+        state: present
+        filename: 'docker'
+
+    - name: '3. Установка Docker CE'
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+
+    - name: '4. Заменить порт в nginx (80 → {{ nginx_port }})'
+      lineinfile:
+        path: /etc/nginx/sites-available/default
+        regexp: '^(\s*)listen\s+80\s+default_server;'
+        line: '\1listen {{ nginx_port }} default_server;'
+        backrefs: yes
+        backup: yes
+      notify: restart nginx
+
+    - name: '5. Создать директорию для бэкапов'
+      file:
+        path: /backup
+        state: directory
+        mode: '0755'
+
+    - name: '5. Создать бэкап конфига с текущей датой'
+      copy:
+        src: /etc/nginx/nginx.conf
+        dest: "/backup/nginx.conf.{{ lookup('pipe', 'date +%Y-%m-%d-%H-%M-%S') }}"
+        remote_src: yes
+        mode: '0644'
+      ignore_errors: yes
+
+    - name: '5. Создать шаблон nginx.conf.j2'
+      copy:
+        content: |
+          user www-data;
+          worker_processes auto;
+          pid /run/nginx.pid;
+
+          events {
+              worker_connections 768;
+          }
+
+          http {
+              sendfile on;
+              tcp_nopush on;
+              tcp_nodelay on;
+              keepalive_timeout 65;
+              types_hash_max_size 2048;
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+
+              access_log /var/log/nginx/access.log;
+              error_log /var/log/nginx/error.log;
+
+              gzip on;
+
+              server {
+                  listen {{ nginx_port }} default_server;
+                  listen [::]:{{ nginx_port }} default_server;
+                  root /var/www/html;
+                  index index.html;
+                  server_name _;
+                  location / {
+                      try_files $uri $uri/ =404;
+                  }
+              }
+          }
+        dest: /home/vagrant/nginx.conf.j2
+        mode: '0644'
+
+    - name: '5. Заменить конфиг через Jinja2'
+      template:
+        src: /home/vagrant/nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+      notify: restart nginx
+      ignore_errors: yes
+
+    - name: '6. Скачать файл из интернета с retry'
+      get_url:
+        url: "{{ download_url }}"
+        dest: "{{ download_dest }}"
+        force: no
+        timeout: 30
+        mode: '0644'
+      register: download_result
+      until: download_result is success
+      retries: 5
+      delay: 10
+      ignore_errors: yes
+
+    - name: '7. Создать скрипт для крона'
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Backup at $(date)" >> /var/log/backup.log
+        dest: /usr/local/bin/backup.sh
+        mode: '0755'
+
+    - name: '7. Добавить крон-задачу (ежедневно в 3:00)'
+      cron:
+        name: "Daily backup"
+        minute: "0"
+        hour: "3"
+        job: "/usr/local/bin/backup.sh"
+        user: root
+        state: present
+      become: yes
+
+    - name: '8. Установить pip и git'
+      apt:
+        name:
+          - python3-pip
+          - git
+        state: present
+
+    - name: '8. Клонировать репозитории (цикл)'
+      git:
+        repo: "{{ item.url }}"
+        dest: "{{ item.dest }}"
+        clone: yes
+        update: yes
+      loop: "{{ git_repos }}"
+      ignore_errors: yes
+
+    - name: '8. Установка зависимостей через pip'
+      pip:
+        name:
+          - requests
+          - click
+          - jinja2
+        state: present
+
+    - name: '9. Перезапуск nginx'
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
